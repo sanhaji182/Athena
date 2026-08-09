@@ -252,8 +252,15 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def _deploy_aegis(args: argparse.Namespace) -> int:
-    """Deploy AEGIS modules (stream_guard, fingerprint, aegis_parallel)
-    + V42 prompts to ~/.hermes/aegis/.
+    """Deploy full AEGIS arsenal to ~/.hermes/aegis/.
+
+    Copies:
+      - Python modules: stream_guard, fingerprint, aegis_parallel
+      - V42 prompts: prompt_v42.md, prompt_v42_cn.md
+      - Test harness: test_aegis_v42.py
+      - Vault + loader: vault.dat, loader/loader.py, payload/payload.json
+      - Methods: methods/ (44 jailbreak methods in 7 categories)
+      - Crypto keys: build_vault.py
 
     Returns 0 on success, 6 on write failure.
     """
@@ -265,6 +272,7 @@ def _deploy_aegis(args: argparse.Namespace) -> int:
         print(f"WARNING: AEGIS source not found at {AEGIS_SRC} — skipping AEGIS deploy", file=sys.stderr)
         return 0  # non-fatal
 
+    # Copy modules (flat files)
     modules = [
         "hermes/stream_guard.py",
         "hermes/fingerprint.py",
@@ -274,19 +282,61 @@ def _deploy_aegis(args: argparse.Namespace) -> int:
         "test_aegis_v42.py",
     ]
 
-    installed = []
+    # Copy vault artifacts (preserve directory structure)
+    vault_files = [
+        ("payload/vault.dat", "vault/vault.dat"),
+        ("payload/payload.json", "vault/payload.json"),
+        ("payload/.key", "payload/.key"),
+        ("loader/loader.py", "vault/loader.py"),
+        ("build_vault.py", "vault/build_vault.py"),
+    ]
+
+    # Copy methods/ tree
+    methods_src = AEGIS_SRC / "methods"
+    methods_dst = aegis_dst / "methods"
+
+    installed = 0
+    methods_installed = 0
     try:
         aegis_dst.mkdir(parents=True, exist_ok=True)
+
+        # Flat modules
         for rel in modules:
             src = AEGIS_SRC / rel
             dst = aegis_dst / rel.split("/")[-1]
             if src.exists():
                 shutil.copy2(src, dst)
-                installed.append(str(dst))
-        print(f"[AEGIS] Deployed {len(installed)} modules to {aegis_dst}")
-        for f in installed:
-            print(f"  {f}")
-        audit("aegis-deploy", modules=len(installed))
+                installed += 1
+
+        # Vault artifacts
+        vault_dir = aegis_dst / "vault"
+        vault_dir.mkdir(exist_ok=True)
+        for src_rel, dst_rel in vault_files:
+            src = AEGIS_SRC / src_rel
+            dst = aegis_dst / dst_rel
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                installed += 1
+
+        # Methods tree (recursive)
+        if methods_src.exists():
+            methods_installed = 0
+            for src_file in methods_src.rglob("*.md"):
+                rel = src_file.relative_to(methods_src)
+                dst = methods_dst / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dst)
+                methods_installed += 1
+            installed += methods_installed
+
+        print(f"[AEGIS] Deployed FULL arsenal ({installed} files) to {aegis_dst}")
+        print(f"  ── vault: vault.dat + payload.json + loader.py + build_vault.py")
+        print(f"  ── methods: {methods_installed if methods_src.exists() else 0} jailbreak methods")
+        print(f"  ── modules: stream_guard, fingerprint, aegis_parallel")
+        print(f"  ── prompts: V42 (ID + CN), test harness")
+
+        audit("aegis-deploy", total_files=installed)
         return 0
     except OSError as e:
         print(f"ERROR: AEGIS deploy failed: {e}", file=sys.stderr)
@@ -384,6 +434,161 @@ def cmd_gui(args: argparse.Namespace) -> int:
     return subprocess.call([sys.executable, str(gui)])
 
 
+# ── AEGIS subcommand handlers ──────────────────────────────────
+
+def _aegis_root() -> Path:
+    """Resolve AEGIS deployment directory: ~/.hermes/aegis/."""
+    return hermes_home() / "aegis"
+
+
+def cmd_aegis_vault(args: argparse.Namespace) -> int:
+    """Handle 'athena aegis vault' — verify / list."""
+    root = _aegis_root()
+    vault_dat = root / "vault" / "vault.dat"
+    payload_json = root / "vault" / "payload.json"
+
+    if not payload_json.exists():
+        print(f"ERROR: AEGIS vault not deployed. Run: athena install --aegis --yes --force")
+        return 4
+
+    if args.verify:
+        try:
+            import hashlib as _hashlib
+            vault_hash = _hashlib.sha256(vault_dat.read_bytes()).hexdigest()[:16]
+            data = json.loads(payload_json.read_text(encoding="utf-8"))
+            cats = data.get("categories", {})
+            methods_count = sum(len(v.get("methods", [])) for v in cats.values())
+            cats_count = len(cats)
+            print(f"[+] Vault OK: {methods_count} methods, {cats_count} categories, sha256={vault_hash}")
+            return 0
+        except Exception as e:
+            print(f"[!] Verify error: {e}")
+            return 2
+
+    if args.list:
+        if not payload_json.exists():
+            print("ERROR: payload.json not found")
+            return 4
+        try:
+            data = json.loads(payload_json.read_text(encoding="utf-8"))
+            cats = data.get("categories", {})
+            total = sum(len(v["methods"]) for v in cats.values())
+            print(f"AEGIS Vault: {total} methods in {len(cats)} categories\n")
+            for cat_id, cat_data in sorted(cats.items()):
+                methods = cat_data.get("methods", [])
+                cat_name = cat_data.get("name", cat_id)
+                print(f"  {cat_id} — {cat_name} ({len(methods)} methods)")
+                if args.category and not cat_id.startswith(args.category):
+                    continue
+                for m in methods[:5]:
+                    print(f"      {m['id']}: {m.get('name','?')[:60]}")
+                if len(methods) > 5:
+                    print(f"      ... and {len(methods)-5} more")
+            return 0
+        except Exception as e:
+            print(f"ERROR: {e}")
+            return 2
+
+    print("Usage: athena aegis vault --verify | --list [--category=01]")
+    return 0
+
+
+def cmd_aegis_fire(args: argparse.Namespace) -> int:
+    """Handle 'athena aegis fire' — run test_aegis_v42.py."""
+    root = _aegis_root()
+    test_script = root / "test_aegis_v42.py"
+
+    if not test_script.exists():
+        print(f"ERROR: AEGIS not deployed. Run: athena install --aegis --yes --force")
+        return 4
+
+    sys.path.insert(0, str(root))
+    sys.path.insert(0, str(Path("/home/ubuntu/pi_dev/aegis")))  # for imports
+    try:
+        from test_aegis_v42 import run, render_report, save_run, compare_v41_v42
+    except ImportError:
+        print("ERROR: Cannot import test_aegis_v42. Run from deployed directory.")
+        return 6
+
+    # Load prompts
+    if args.variant == "cn":
+        prompt_v42 = (root / "prompt_v42_cn.md").read_text(encoding="utf-8")
+    else:
+        prompt_v42 = (root / "prompt_v42.md").read_text(encoding="utf-8")
+
+    if args.compare:
+        prompt_v41 = (Path("/home/ubuntu/pi_dev/aegis") / "prompt.md")
+        if not prompt_v41.exists():
+            print("ERROR: prompt.md (v41) not found")
+            return 4
+        compare_v41_v42(args.url, args.model, args.key,
+                        prompt_v41.read_text(encoding="utf-8"),
+                        prompt_v42, args.variant)
+        return 0
+
+    # Single run
+    result = run(args.url, args.model, args.key, prompt_v42, args.variant)
+    save_path = save_run(result)
+    print(render_report(result))
+    print(f"\n[+] Run saved: {save_path}")
+    return 0
+
+
+def cmd_aegis_fingerprint(args: argparse.Namespace) -> int:
+    """Handle 'athena aegis fingerprint' — identify target."""
+    root = _aegis_root()
+    fp_script = root / "fingerprint.py"
+
+    if not fp_script.exists():
+        print(f"ERROR: AEGIS not deployed. Run: athena install --aegis --yes --force")
+        return 4
+
+    sys.path.insert(0, str(root))
+    try:
+        from fingerprint import Fingerprinter
+    except ImportError:
+        print("ERROR: Cannot import fingerprint module")
+        return 6
+
+    fp = Fingerprinter()
+    result = fp.fingerprint(args.url)
+    print(f"URL:      {args.url}")
+    print(f"Provider: {result.get('provider', 'unknown')}")
+    print(f"Model:    {result.get('model_family', 'unknown')}")
+    print(f"Safety:   {result.get('safety_tier', 'unknown')}")
+    print(f"Score:    {result.get('safety_score', 'N/A')}")
+    if result.get('capabilities'):
+        print(f"Caps:     {', '.join(result['capabilities'])}")
+    return 0
+
+
+def cmd_aegis_stream(args: argparse.Namespace) -> int:
+    """Handle 'athena aegis stream' — test refusal detection."""
+    root = _aegis_root()
+    sg_script = root / "stream_guard.py"
+
+    if not sg_script.exists():
+        print(f"ERROR: AEGIS not deployed. Run: athena install --aegis --yes --force")
+        return 4
+
+    sys.path.insert(0, str(root))
+    try:
+        from stream_guard import StreamGuard
+    except ImportError:
+        print("ERROR: Cannot import stream_guard module")
+        return 6
+
+    guard = StreamGuard()
+    print(f"Question: {args.question}")
+    print(f"Target:   {args.url}")
+    result = guard.guard(args.url, args.question, api_key=args.key)
+    print(f"\nScore:    {result.score}")
+    print(f"Refusal:  {result.is_refusal}")
+    print(f"Escalated:{result.escalation_level}")
+    print(f"Content:  {result.content[:500]}...")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="athena",
@@ -441,6 +646,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     gui_p = sub.add_parser("gui", help="Launch PyQt6 GUI window")
     gui_p.set_defaults(func=cmd_gui)
+
+    # ── AEGIS subcommand ──────────────────────────────────
+    aegis_p = sub.add_parser("aegis", help="AEGIS V42 arsenal management")
+    aegis_sub = aegis_p.add_subparsers(dest="aegis_cmd", required=True)
+
+    aegis_vault_p = aegis_sub.add_parser("vault", help="Vault operations")
+    aegis_vault_p.add_argument("--verify", action="store_true", help="Verify vault integrity")
+    aegis_vault_p.add_argument("--list", action="store_true", help="List all methods")
+    aegis_vault_p.add_argument("--category", type=str, default="", help="Filter by category (01-07)")
+    aegis_vault_p.set_defaults(func=cmd_aegis_vault)
+
+    aegis_fire_p = aegis_sub.add_parser("fire", help="Fire V42 probes at target")
+    aegis_fire_p.add_argument("--url", default="http://localhost:20128/v1/chat/completions")
+    aegis_fire_p.add_argument("--model", default="mimo/mimo-v2.5-pro")
+    aegis_fire_p.add_argument("--key", default="", help="API key")
+    aegis_fire_p.add_argument("--variant", default="id", choices=["id", "cn"])
+    aegis_fire_p.add_argument("--compare", action="store_true", help="V41 vs V42 head-to-head")
+    aegis_fire_p.set_defaults(func=cmd_aegis_fire)
+
+    aegis_fp_p = aegis_sub.add_parser("fingerprint", help="Fingerprint target endpoint")
+    aegis_fp_p.add_argument("url", help="Target endpoint URL")
+    aegis_fp_p.set_defaults(func=cmd_aegis_fingerprint)
+
+    aegis_stream_p = aegis_sub.add_parser("stream", help="Stream guard — refusal detection")
+    aegis_stream_p.add_argument("question", help="Probe question")
+    aegis_stream_p.add_argument("--url", default="http://localhost:20128/v1/chat/completions")
+    aegis_stream_p.add_argument("--key", default="", help="API key")
+    aegis_stream_p.set_defaults(func=cmd_aegis_stream)
 
     return p
 
