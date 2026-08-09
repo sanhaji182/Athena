@@ -193,6 +193,16 @@ def cmd_plan(args: argparse.Namespace) -> int:
             "any other ~/.hermes/* file",
         ],
     }
+    
+    if args.aegis:
+        plan["aegis"] = {
+            "source": "/home/ubuntu/pi_dev/aegis",
+            "modules": [
+                "stream_guard.py", "fingerprint.py", "aegis_parallel.py",
+                "prompt_v42.md", "prompt_v42_cn.md", "test_aegis_v42.py",
+            ],
+            "deploy_to": str(home / "aegis"),
+        }
 
     if args.json:
         print(json.dumps(plan, indent=2))
@@ -212,6 +222,9 @@ def cmd_install(args: argparse.Namespace) -> int:
     """Delegate to scripts/install.sh via subprocess.
 
     The CLI is sugar. The install script is the source of truth.
+
+    When --aegis is passed, also deploy AEGIS modules (stream_guard,
+    fingerprint, aegis_parallel) to ~/.hermes/aegis/ alongside Athena.
     """
     if not hermes_home().exists():
         print("ERROR: Hermes root does not exist. Run `hermes init` first.", file=sys.stderr)
@@ -228,10 +241,56 @@ def cmd_install(args: argparse.Namespace) -> int:
     if args.force:
         argv.append("--force")
 
-    audit("install-start", profile=args.profile, force=args.force)
+    audit("install-start", profile=args.profile, force=args.force, aegis=args.aegis)
     rc = subprocess.call(argv)
-    audit("install-end", profile=args.profile, force=args.force, exit_code=rc)
+    
+    if rc == 0 and args.aegis:
+        rc = _deploy_aegis(args)
+    
+    audit("install-end", profile=args.profile, force=args.force, aegis=args.aegis, exit_code=rc)
     return rc
+
+
+def _deploy_aegis(args: argparse.Namespace) -> int:
+    """Deploy AEGIS modules (stream_guard, fingerprint, aegis_parallel)
+    + V42 prompts to ~/.hermes/aegis/.
+
+    Returns 0 on success, 6 on write failure.
+    """
+    AEGIS_SRC = Path("/home/ubuntu/pi_dev/aegis")
+    home = hermes_home()
+    aegis_dst = home / "aegis"
+
+    if not AEGIS_SRC.exists():
+        print(f"WARNING: AEGIS source not found at {AEGIS_SRC} — skipping AEGIS deploy", file=sys.stderr)
+        return 0  # non-fatal
+
+    modules = [
+        "hermes/stream_guard.py",
+        "hermes/fingerprint.py",
+        "hermes/aegis_parallel.py",
+        "prompt_v42.md",
+        "prompt_v42_cn.md",
+        "test_aegis_v42.py",
+    ]
+
+    installed = []
+    try:
+        aegis_dst.mkdir(parents=True, exist_ok=True)
+        for rel in modules:
+            src = AEGIS_SRC / rel
+            dst = aegis_dst / rel.split("/")[-1]
+            if src.exists():
+                shutil.copy2(src, dst)
+                installed.append(str(dst))
+        print(f"[AEGIS] Deployed {len(installed)} modules to {aegis_dst}")
+        for f in installed:
+            print(f"  {f}")
+        audit("aegis-deploy", modules=len(installed))
+        return 0
+    except OSError as e:
+        print(f"ERROR: AEGIS deploy failed: {e}", file=sys.stderr)
+        return 6
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -345,13 +404,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan_p = sub.add_parser("plan", help="Read-only install plan")
     plan_p.add_argument("--profile", default="max-breaker",
-                        choices=["max-breaker", "builder", "research", "creative"])
+                        choices=["max-breaker", "max-breaker-v42", "builder", "research", "creative"])
+    plan_p.add_argument("--aegis", action="store_true",
+                        help="Include AEGIS modules deployment in plan")
     plan_p.add_argument("--json", action="store_true")
     plan_p.set_defaults(func=cmd_plan)
 
     install_p = sub.add_parser("install", help="Atomic transactional install")
     install_p.add_argument("--profile", default="max-breaker",
-                          choices=["max-breaker", "builder", "research", "creative"])
+                          choices=["max-breaker", "max-breaker-v42", "builder", "research", "creative"])
+    install_p.add_argument("--aegis", action="store_true",
+                          help="Deploy AEGIS modules (stream_guard, fingerprint, parallel) alongside Athena")
     install_p.add_argument("--yes", action="store_true",
                            help="Skip two-step confirmation (required for non-interactive)")
     install_p.add_argument("--force", action="store_true",
